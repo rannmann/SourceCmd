@@ -18,35 +18,29 @@
 //
 // Gets the handle of a module in another process
 //
-HMODULE GetRemoteModule( int pid, const TCHAR* name, size_t* size = NULL )
+bool GetRemoteModuleInfo( int pid, const TCHAR* name, MODULEENTRY32& me )
 {
-	HANDLE hSnap = CreateToolhelp32Snapshot( TH32CS_SNAPMODULE, pid );
-	if ( hSnap==INVALID_HANDLE_VALUE )
-		return NULL;
-
-	MODULEENTRY32 me;
-	me.dwSize = sizeof(me);
-
-	if ( !Module32First( hSnap, &me ) )
+	HANDLE hSnap = ::CreateToolhelp32Snapshot( TH32CS_SNAPMODULE, pid );
+	if ( hSnap!=INVALID_HANDLE_VALUE )
 	{
-		CloseHandle( hSnap );
-		return NULL;
-	}
+		me.dwSize = sizeof(me);
 
-	do
-	{
-		// wcscmp implies default of wide chars...
-		if ( !wcscmp( name, me.szModule ) )
+		if ( ::Module32First( hSnap, &me ) )
 		{
-			CloseHandle( hSnap );
-			if ( size ) *size = me.modBaseSize;
-			return (HMODULE) me.modBaseAddr;
+			do
+			{
+				if ( !_tcscmp( name, me.szModule ) )
+				{
+					::CloseHandle( hSnap );
+					return true;
+				}
+			}
+			while( ::Module32Next( hSnap, &me ) );
 		}
-	}
-	while( Module32Next( hSnap, &me ) );
 
-	CloseHandle( hSnap );
-	return NULL;
+		::CloseHandle( hSnap );
+	}
+	return false;
 }
 //----------------------------------------------------------------
 // Function: FindPattern
@@ -57,10 +51,15 @@ HMODULE GetRemoteModule( int pid, const TCHAR* name, size_t* size = NULL )
 // Mask should either contain \xFF (scan) or \x00 (ignore).
 // Templated version to make your life easier.
 //
-template< size_t L >
+template< unsigned int L >
 inline void* FindPattern( void* begin, void* end, const char (&pat)[L], const char (&mask)[L] )
 {
 	return FindPattern( begin, end, pat, mask, L );
+}
+template< unsigned int L >
+inline void* FindPattern( void* ptr, unsigned int size, const char (&pat)[L], const char (&mask)[L] )
+{
+	return FindPattern( ptr, (char*)ptr + size, pat, mask, L );
 }
 void* FindPattern( void* begin, void* end, const char* pat, const char* mask, size_t len )
 {
@@ -98,6 +97,8 @@ public:
 
 	bool RunCmd( const char* cmd );
 
+	static void RunInAllInstances( const TCHAR* bin, const char* cmd );
+
 private:
 	// Game process handle
 	HANDLE mhProcess;
@@ -109,88 +110,118 @@ private:
 
 CSourceCommand::~CSourceCommand()
 {
-	if ( mpRemoteBuf ) VirtualFreeEx( mhProcess, mpRemoteBuf, bufsize, MEM_DECOMMIT );
-	if ( mhProcess ) CloseHandle( mhProcess );
+	if ( mpRemoteBuf )
+		::VirtualFreeEx( mhProcess, mpRemoteBuf, bufsize, MEM_DECOMMIT );
+	if ( mhProcess )
+		::CloseHandle( mhProcess );
 }
 bool CSourceCommand::Init( const TCHAR* process )
 {
-	HANDLE hSnap = CreateToolhelp32Snapshot( TH32CS_SNAPPROCESS, 0 );
-	if ( hSnap==INVALID_HANDLE_VALUE )
-		return false;
-
-	PROCESSENTRY32 pe;
-	pe.dwSize = sizeof(pe);
-
-	if ( !Process32First( hSnap, &pe ) )
+	HANDLE hSnap = ::CreateToolhelp32Snapshot( TH32CS_SNAPPROCESS, 0 );
+	if ( hSnap!=INVALID_HANDLE_VALUE )
 	{
-		CloseHandle( hSnap );
-		return false;
-	}
+		PROCESSENTRY32 pe;
+		pe.dwSize = sizeof(pe);
 
-	do
-	{
-		if ( !wcscmp( process, pe.szExeFile ) )
+		if ( ::Process32First( hSnap, &pe ) )
 		{
-			CloseHandle( hSnap );
-			return Init( pe.th32ProcessID );
+			do
+			{
+				if ( !_tcscmp( process, pe.szExeFile ) )
+				{
+					::CloseHandle( hSnap );
+					return Init( pe.th32ProcessID );
+				}
+			}
+			while( ::Process32Next( hSnap, &pe ) );
 		}
+		::CloseHandle( hSnap );
 	}
-	while( Process32Next( hSnap, &pe ) );
-
-	CloseHandle( hSnap );
 	return false;
 }
 bool CSourceCommand::Init( int pid )
 {
 	// Access the process
-	if ( !( mhProcess = OpenProcess( PROCESS_VM_OPERATION|PROCESS_VM_READ|PROCESS_VM_WRITE|PROCESS_CREATE_THREAD|PROCESS_QUERY_INFORMATION, FALSE, pid ) ) )
-		return false;
-
-	// Create a temp buffer in the game process
-	if ( !( mpRemoteBuf = VirtualAllocEx( mhProcess, NULL, bufsize, MEM_COMMIT, PAGE_EXECUTE_READWRITE ) ) )
-		return false;
-
-	// Find and dump engine.dll
-	size_t size;
-	HMODULE hmEngine = GetRemoteModule( pid, TEXT("engine.dll"), &size );
-	if ( !hmEngine ) return false;
-	void* dump = malloc( size );
-	if ( !ReadProcessMemory( mhProcess, hmEngine, dump, size, NULL ) )
+	if ( mhProcess = OpenProcess( PROCESS_VM_OPERATION|PROCESS_VM_READ|PROCESS_VM_WRITE|PROCESS_CREATE_THREAD|PROCESS_QUERY_INFORMATION, FALSE, pid ) )
 	{
-		free( dump );
-		return false;
+		// Create a temp buffer in the game process
+		if ( mpRemoteBuf = VirtualAllocEx( mhProcess, NULL, bufsize, MEM_COMMIT, PAGE_READWRITE ) )
+		{
+			// Find engine.dll
+			MODULEENTRY32 me;
+			if ( GetRemoteModuleInfo( pid, TEXT("engine.dll"), me ) )
+			{
+				size_t size = me.modBaseSize;
+				HMODULE hmEngine = (HMODULE)me.modBaseAddr;
+
+				// And dump it
+				void* dump = malloc( size );
+				if ( ReadProcessMemory( mhProcess, hmEngine, dump, size, NULL ) )
+				{
+					// Do a sigscan for CVEngineClient::ExecuteClientCmd
+					// (old) Pattern: 8B 44 24 04 50 E8 ? ? ? ? 68 ? ? ? ? E8 ? ? ? ? 83 C4 08 E8 ? ? ? ? C2 04 00
+					// Pattern: 55 8B EC 8B 45 08 50 E8 ? ? ? ? 68 ? ? ? ? E8 ? ? ? ? 83 C4 08 5D C2 04 00
+					if ( void* p = FindPattern( dump, size,
+						"\x55\x8B\xEC\x8B\x45\x08\x50\xE8\x00\x00\x00\x00\x68\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x83\xC4\x08\x5D\xC2\x04\x00",
+						"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\x00\x00\x00\x00\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF\xFF\xFF\xFF" ) )
+					{
+						mpfnRunCmd = reinterpret_cast<void*>( (size_t)p - (size_t)dump + (size_t)hmEngine );
+						free( dump );
+						return true;
+					}
+				}
+				free( dump );
+			}
+		}
 	}
-
-	// Do a sigscan for CVEngineClient::ExecuteClientCmd
-	// (old) Pattern: 8B 44 24 04 50 E8 ? ? ? ? 68 ? ? ? ? E8 ? ? ? ? 83 C4 08 E8 ? ? ? ? C2 04 00
-	// Pattern: 55 8B EC 8B 45 08 50 E8 ? ? ? ? 68 ? ? ? ? E8 ? ? ? ? 83 C4 08 5D C2 04 00
-	void* p = FindPattern( dump, reinterpret_cast<void*>( (size_t)dump + size ),
-		"\x55\x8B\xEC\x8B\x45\x08\x50\xE8\x00\x00\x00\x00\x68\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x83\xC4\x08\x5D\xC2\x04\x00",
-		"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\x00\x00\x00\x00\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF\xFF\xFF\xFF" );
-	free( dump );
-	if ( !p ) return false;
-	mpfnRunCmd = reinterpret_cast<void*>( (size_t)p - (size_t)dump + (size_t)hmEngine );
-
-	return true;
+	return false;
 }
-
-
 bool CSourceCommand::RunCmd( const char* cmd )
 {
 	// Check str length
 	size_t size = strlen( cmd )+1;
-	if ( size>bufsize ) return false;
+	if ( size<=bufsize )
+	{
+		// Write the string
+		if ( ::WriteProcessMemory( mhProcess, mpRemoteBuf, cmd, size, NULL ) )
+		{
+			// Run command
+			if ( HANDLE hThread = ::CreateRemoteThread( mhProcess, NULL, 0, (LPTHREAD_START_ROUTINE)mpfnRunCmd, mpRemoteBuf, 0, NULL ) )
+			{
+				::WaitForSingleObject( hThread, INFINITE );
+				::CloseHandle( hThread );
+				// Success
+				return true;
+			}
+		}
+	}
+	return false;
+}
+void CSourceCommand::RunInAllInstances( const TCHAR* bin, const char* cmd )
+{
+	HANDLE hSnap = ::CreateToolhelp32Snapshot( TH32CS_SNAPPROCESS, 0 );
+	if ( hSnap!=INVALID_HANDLE_VALUE )
+	{
+		PROCESSENTRY32 pe;
+		pe.dwSize = sizeof(pe);
 
-	// Write the string
-	if ( !WriteProcessMemory( mhProcess, mpRemoteBuf, cmd, size, NULL ) )
-		return false;
-
-	// Run command
-	HANDLE hRemThread = CreateRemoteThread( mhProcess, NULL, 0, (LPTHREAD_START_ROUTINE)mpfnRunCmd, mpRemoteBuf, 0, NULL );
-	if ( !hRemThread ) return false;
-
-	// Success
-	return true;
+		// Loop over & run command in all matching processes
+		if ( ::Process32First( hSnap, &pe ) )
+		{
+			do
+			{
+				if ( !wcscmp( bin, pe.szExeFile ) )
+				{
+					// Try to run the command for this process
+					CSourceCommand sc;
+					if ( sc.Init( pe.th32ProcessID ) && sc.RunCmd( cmd ) )
+						continue;
+				}
+			}
+			while( ::Process32Next( hSnap, &pe ) );
+		}
+		::CloseHandle( hSnap );
+	}
 }
 
 
@@ -216,7 +247,7 @@ int _tmain( int argc, TCHAR* argv[] )
 		CSourceCommand src;
 
 		std::cout <<
-			"Welcome to SourceCmd made by Cryzbl!\n"
+			"Welcome to SourceCmd made by Casual!\n"
 			"This program allows you to execute commands in any opened source engine game.\n"
 			"Command line mode: SourceCmd.exe <process> <commands>\n"
 			"Type 'q' to end.\n"
@@ -253,22 +284,15 @@ int _tmain( int argc, TCHAR* argv[] )
 	// Auto mode
 	else
 	{
-		CSourceCommand src;
-		if ( !src.Init( argv[1] ) )
-		{
-			std::cout << "Failed to initialize!\n";
-			return 1;
-		}
+		// Ok lol, input is in wchar_t and I need chars...
 		std::string cmd("");
-		for ( const TCHAR* str = argv[3]; *str; str++ )
+		for ( const TCHAR* str = argv[2]; *str; str++ )
 		{
 			cmd.push_back( static_cast<char>( *str ) );
 		}
-		if ( !src.RunCmd( cmd.c_str() ) )
-		{
-			std::cout << "Failed to execute!\n";
-			return 1;
-		}
+
+		// No error reporting... *yikes*
+		CSourceCommand::RunInAllInstances( argv[1], cmd.c_str() );
 	}
 
 	return 0;
