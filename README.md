@@ -14,13 +14,15 @@ Usage
 -------
 
 ### Interactive Mode (only supports 1 instance at a time):
-Launch your favourite source engine game. 
-Open SourceCmd.exe
-Type the name of the game's executable (for TF2 and CSS it's hl2.exe) and press enter.
-Type any console command you want.
+* Launch your favourite source engine game. 
+* Open SourceCmd.exe
+* Type the name of the game's executable (for TF2 and CSS it's hl2.exe) and press enter.
+* Type any console command you want.
 
 
 ### Command line usage (will run in every process it finds):
-SourceCmd.exe <process> <command>
-Example 
+SourceCmd.exe \<process\> \<command\>
+
+Example:
+
     SourceCmd.exe "hl2.exe" "echo Hello World!"
