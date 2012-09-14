@@ -142,10 +142,10 @@ bool CSourceCommand::Init( const TCHAR* process )
 bool CSourceCommand::Init( int pid )
 {
 	// Access the process
-	if ( mhProcess = OpenProcess( PROCESS_VM_OPERATION|PROCESS_VM_READ|PROCESS_VM_WRITE|PROCESS_CREATE_THREAD|PROCESS_QUERY_INFORMATION, FALSE, pid ) )
+	if ( mhProcess = ::OpenProcess( PROCESS_VM_OPERATION|PROCESS_VM_READ|PROCESS_VM_WRITE|PROCESS_CREATE_THREAD|PROCESS_QUERY_INFORMATION, FALSE, pid ) )
 	{
 		// Create a temp buffer in the game process
-		if ( mpRemoteBuf = VirtualAllocEx( mhProcess, NULL, bufsize, MEM_COMMIT, PAGE_READWRITE ) )
+		if ( mpRemoteBuf = ::VirtualAllocEx( mhProcess, NULL, bufsize, MEM_COMMIT, PAGE_READWRITE ) )
 		{
 			// Find engine.dll
 			MODULEENTRY32 me;
@@ -156,14 +156,15 @@ bool CSourceCommand::Init( int pid )
 
 				// And dump it
 				void* dump = malloc( size );
-				if ( ReadProcessMemory( mhProcess, hmEngine, dump, size, NULL ) )
+				if ( ::ReadProcessMemory( mhProcess, hmEngine, dump, size, NULL ) )
 				{
-					// Do a sigscan for CVEngineClient::ExecuteClientCmd
+					// Do a sigscan for CEngineClient::ExecuteClientCmd
 					// (old) Pattern: 8B 44 24 04 50 E8 ? ? ? ? 68 ? ? ? ? E8 ? ? ? ? 83 C4 08 E8 ? ? ? ? C2 04 00
-					// Pattern: 55 8B EC 8B 45 08 50 E8 ? ? ? ? 68 ? ? ? ? E8 ? ? ? ? 83 C4 08 5D C2 04 00
+					// (old) Pattern: 55 8B EC 8B 45 08 50 E8 ? ? ? ? 68 ? ? ? ? E8 ? ? ? ? 83 C4 08 5D C2 04 00
+					// Pattern: 55 8B EC 8B 45 08 50 E8 ? ? ? ? 83 C4 04 5D C2 04 00
 					if ( void* p = FindPattern( dump, size,
-						"\x55\x8B\xEC\x8B\x45\x08\x50\xE8\x00\x00\x00\x00\x68\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x83\xC4\x08\x5D\xC2\x04\x00",
-						"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\x00\x00\x00\x00\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF\xFF\xFF\xFF" ) )
+						"\x55\x8B\xEC\x8B\x45\x08\x50\xE8\x00\x00\x00\x00\x83\xC4\x04\x5D\xC2\x04\x00",
+						"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF\xFF\xFF\xFF" ) )
 					{
 						mpfnRunCmd = reinterpret_cast<void*>( (size_t)p - (size_t)dump + (size_t)hmEngine );
 						free( dump );
